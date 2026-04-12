@@ -1,344 +1,168 @@
 """
-models/nlp_model.py — DistilBERT for clinical text classification.
-
-Task:    3-class NLI (Natural Language Inference) on clinical statements:
-         entailment / neutral / contradiction
-         OR binary classification (use whichever dataset you can access first)
-
-Dataset options (pick one):
-  Option A — MedNLI (recommended, free):
-    https://physionet.org/content/mednli/1.0.0/
-    Same PhysioNet access as MIMIC-III. 3-class NLI on clinical notes.
-
-  Option B — PubMed 200k RCT (no credentialing, easier to start):
-    https://github.com/Franck-Dernoncourt/pubmed-rct
-    5-class sentence classification (background/objective/methods/results/conclusions)
-    Great for testing your pipeline while waiting for MIMIC access.
-
-  Option C — MIMIC-III NOTEEVENTS (if you have MIMIC access):
-    Extract clinical notes and predict discharge disposition or readmission.
-    More preprocessing but more clinically relevant.
-
-Input:   Variable-length text strings → tokenized to max 512 tokens
-         Variable length is the interesting systems challenge:
-         padding makes batching inefficient, which motivates your scheduler.
-
-Output:  (batch_size, num_classes) — class probabilities
-
-SLA:     300ms (MID priority — EHR assistant, must feel interactive)
-Target:  ~82% accuracy on MedNLI (DistilBERT fine-tuned baseline)
-
-Why DistilBERT?
-  - 40% smaller, 60% faster than BERT-base
-  - Only 2% accuracy drop vs BERT on GLUE
-  - Ideal for latency-sensitive serving (300ms SLA is tight for transformers)
+models/nlp_model.py — Clinical NLP using BiomedBERT pretrained weights.
+No training required. Uses microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract
+— a BERT model pretrained on 21M PubMed abstracts + 3M full-text articles.
+Falls back to distilbert-base-uncased if BiomedBERT unavailable.
 """
 
 import time
 import torch
 import torch.nn as nn
-from typing import Tuple, List, Optional, Union
-from transformers import (
-    DistilBertTokenizer,
-    DistilBertForSequenceClassification,
-    DistilBertConfig,
-)
+from typing import Any, List
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from models.base import BaseInferenceEngine, ModelMetadata
+from system.request import ModelType
+
+MEDNLI_LABELS = ["entailment", "neutral", "contradiction"]
+PUBMED_LABELS = ["background", "objective", "methods", "results", "conclusions"]
+
+# Best pretrained options in priority order
+_PRETRAINED_OPTIONS = [
+    # BiomedBERT: pretrained on PubMed, strong clinical text understanding
+    "microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract",
+    # SciBERT: pretrained on scientific papers
+    "allenai/scibert_scivocab_uncased",
+    # General fallback: SST-2 fine-tuned DistilBERT (binary, just for smoke testing)
+    "distilbert-base-uncased-finetuned-sst-2-english",
+]
 
 
-# ---------------------------------------------------------------------------
-# Label sets (choose based on your dataset)
-# ---------------------------------------------------------------------------
-
-MEDNLI_LABELS     = ["entailment", "neutral", "contradiction"]
-PUBMED_RCT_LABELS = ["background", "objective", "methods", "results", "conclusions"]
-
-
-# ---------------------------------------------------------------------------
-# Inference engine
-# ---------------------------------------------------------------------------
-
-class NLPInferenceEngine:
+class NLPInferenceEngine(BaseInferenceEngine):
     """
-    DistilBERT for clinical text classification.
+    BiomedBERT-based clinical text classifier.
+    Input: string or list of strings   Output: (batch, num_classes)   SLA: 300ms
 
-    Key design decision: tokenization happens INSIDE infer(), not outside.
-    This is intentional — the scheduler passes raw text strings, and
-    batching variable-length sequences is a core research challenge.
-    You will study how padding overhead affects latency in your experiments.
+    For benchmarking purposes, the model runs sequence classification.
+    The exact task/labels don't matter for scheduler benchmarking —
+    what matters is the compute profile (transformer forward pass on variable-length text).
     """
 
-    def __init__(
-        self,
-        model_path:  str = None,       # path to fine-tuned weights OR HF model name
-        num_classes: int = 3,          # 3 for MedNLI, 5 for PubMed RCT
-        labels:      List[str] = None,
-        device:      str = "cuda" if torch.cuda.is_available() else "cpu",
-        max_length:  int = 256,        # clinical texts rarely exceed 256 tokens
-        use_fp16:    bool = True,
-    ):
-        self.device     = torch.device(device)
-        self.max_length = max_length
-        self.use_fp16   = use_fp16 and (device == "cuda")
-        self.labels     = labels or MEDNLI_LABELS
+    def __init__(self, model_path=None, num_classes=2, labels=None,
+                 max_length=128, device="cuda" if torch.cuda.is_available() else "cpu",
+                 use_fp16=True):
+        self.num_classes = num_classes
+        self.max_length  = max_length
+        self.labels      = labels or MEDNLI_LABELS[:num_classes]
+        self._model_name = None
+        # Tokenizer loaded in _load_model so device is available
+        super().__init__(model_path=model_path, device=device, use_fp16=use_fp16)
 
-        # Tokenizer
-        self.tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
+    def _load_model(self):
+        # If a local fine-tuned path is given, use it directly
+        if self.model_path and not any(self.model_path.startswith(opt) for opt in _PRETRAINED_OPTIONS):
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+                self.model = AutoModelForSequenceClassification.from_pretrained(
+                    "distilbert-base-uncased", num_labels=self.num_classes
+                )
+                self.model.load_state_dict(torch.load(self.model_path, map_location=self.device))
+                self._model_name = f"fine-tuned:{self.model_path}"
+                print(f"[NLP] Loaded fine-tuned weights from {self.model_path}")
+                self.model.to(self.device)
+                return
+            except Exception as e:
+                print(f"[NLP] Could not load {self.model_path}: {e} — trying pretrained")
 
-        # Model
-        if model_path and not model_path.startswith("distilbert"):
-            # Load fine-tuned local checkpoint
-            config = DistilBertConfig.from_pretrained(
-                "distilbert-base-uncased", num_labels=num_classes
+        # Try pretrained options in order
+        hf_name = self.model_path or None
+        loaded  = False
+
+        candidates = [hf_name] + _PRETRAINED_OPTIONS if hf_name else _PRETRAINED_OPTIONS
+
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            try:
+                print(f"[NLP] Trying: {candidate}")
+                self.tokenizer = AutoTokenizer.from_pretrained(candidate)
+                self.model     = AutoModelForSequenceClassification.from_pretrained(
+                    candidate,
+                    num_labels=self.num_classes,
+                    ignore_mismatched_sizes=True,  # allows loading with different num_labels
+                )
+                self._model_name = candidate
+                loaded = True
+                print(f"[NLP] Loaded: {candidate}")
+                break
+            except Exception as e:
+                print(f"[NLP]   Failed ({type(e).__name__}: {str(e)[:80]})")
+                continue
+
+        if not loaded:
+            raise RuntimeError(
+                "Could not load any NLP model. Check internet connectivity on Kaggle/Colab."
             )
-            self.model = DistilBertForSequenceClassification(config)
-            state = torch.load(model_path, map_location=self.device)
-            self.model.load_state_dict(state)
-            print(f"[NLP] Loaded fine-tuned weights from {model_path}")
-        else:
-            # Use pretrained (not fine-tuned) for smoke testing
-            # In production: replace with fine-tuned checkpoint
-            hf_name = model_path or "distilbert-base-uncased-finetuned-sst-2-english"
-            self.model = DistilBertForSequenceClassification.from_pretrained(hf_name)
-            print(f"[NLP] Loaded HuggingFace model: {hf_name}")
-            print("[NLP] NOTE: For research use, fine-tune on MedNLI or PubMed RCT")
 
         self.model.to(self.device)
-        self.model.eval()
 
-        if self.use_fp16:
-            self.model = self.model.half()
-            print("[NLP] Running in FP16 mode")
-
-    @torch.no_grad()
-    def infer(
-        self,
-        texts: Union[str, List[str]],
-    ) -> Tuple[torch.Tensor, float]:
-        """
-        Classify one or more clinical text strings.
-
-        Args:
-            texts: A single string OR a list of strings.
-                   Variable length is expected — this is the point.
-                   The tokenizer pads to the longest sequence in the batch.
-
-        Returns:
-            probs:             (batch_size, num_classes) — class probabilities
-            inference_time_ms: wall-clock time including tokenization
-
-        NOTE: We include tokenization in the timing because the scheduler
-        receives raw text. The tokenization overhead is real system cost.
-
-        Example:
-            engine = NLPInferenceEngine()
-            texts = ["Patient shows signs of acute respiratory failure",
-                     "No evidence of pneumonia on chest radiograph"]
-            probs, latency = engine.infer(texts)
-            # probs[0] = probabilities for first text
-        """
-        if isinstance(texts, str):
-            texts = [texts]
-
-        t_start = time.perf_counter()
-
-        # Tokenize — padding to longest in batch, truncate at max_length
-        # This is where variable-length inputs create padding overhead
+    def _prepare_batch(self, inputs: List[str]) -> dict:
+        """Tokenize full batch — captures padding overhead in latency measurement."""
         encoded = self.tokenizer(
-            texts,
-            padding=True,          # pad to longest sequence in batch
-            truncation=True,       # truncate at max_length
-            max_length=self.max_length,
-            return_tensors="pt",
+            inputs, padding=True, truncation=True,
+            max_length=self.max_length, return_tensors="pt",
+        )
+        return {k: v.to(self.device) for k, v in encoded.items()}
+
+    def _forward(self, batch: dict) -> torch.Tensor:
+        out = self.model(**batch)
+        return torch.softmax(out.logits, dim=-1).cpu().float()
+
+    def preprocess(self, raw_input: Any) -> str:
+        return str(raw_input)
+
+    @property
+    def metadata(self) -> ModelMetadata:
+        return ModelMetadata(
+            model_type=ModelType.NLP,
+            model_name=self._model_name or "BiomedBERT-pretrained",
+            input_shape=None,
         )
 
-        input_ids      = encoded["input_ids"].to(self.device)
-        attention_mask = encoded["attention_mask"].to(self.device)
 
-        if self.use_fp16:
-            # Token IDs stay int, but we note this for the model
-            pass  # DistilBERT handles FP16 internally via model.half()
-
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        )
-
-        probs = torch.softmax(outputs.logits, dim=-1).float()
-
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
-
-        inference_time_ms = (time.perf_counter() - t_start) * 1000
-
-        return probs.cpu(), inference_time_ms
-
-    def predict(
-        self, texts: Union[str, List[str]]
-    ) -> Tuple[List[str], List[float], float]:
-        """
-        Convenience method: returns predicted label names and confidence scores.
-
-        Returns:
-            predicted_labels: list of predicted class names
-            confidences:      list of confidence scores (max probability)
-            inference_time_ms
-        """
-        probs, latency = self.infer(texts)
-        predicted_indices = probs.argmax(dim=-1).tolist()
-        confidences       = probs.max(dim=-1).values.tolist()
-        predicted_labels  = [self.labels[i] for i in predicted_indices]
-        return predicted_labels, confidences, latency
-
-
-# ---------------------------------------------------------------------------
-# Training helper
-# ---------------------------------------------------------------------------
-
-def train_nlp_model(
-    train_texts:  List[str],
-    train_labels: List[int],
-    val_texts:    List[str],
-    val_labels:   List[int],
-    num_classes:  int = 3,
-    epochs:       int = 3,        # 3 epochs is usually enough for DistilBERT fine-tuning
-    batch_size:   int = 32,
-    lr:           float = 2e-5,   # Standard BERT fine-tuning LR
-    save_path:    str = "results/nlp_model.pt",
-    device:       str = "cuda" if torch.cuda.is_available() else "cpu",
-) -> DistilBertForSequenceClassification:
-    """
-    Fine-tune DistilBERT on clinical text classification.
-
-    For MedNLI:
-        train_texts: list of clinical premise+hypothesis pairs (concatenated)
-        train_labels: 0=entailment, 1=neutral, 2=contradiction
-        Expected accuracy after 3 epochs: ~82%
-
-    For PubMed RCT:
-        train_texts: individual sentences from RCT abstracts
-        train_labels: 0=background, 1=objective, 2=methods, 3=results, 4=conclusions
-        Expected accuracy after 3 epochs: ~88%
-    """
+def train_nlp_model(train_texts, train_labels, val_texts, val_labels,
+                    num_classes=5, epochs=3, batch_size=32, lr=2e-5,
+                    save_path="results/weights/nlp_model.pt", device="cuda"):
+    """Optional fine-tuning on top of pretrained BiomedBERT."""
+    import os
     from torch.utils.data import Dataset, DataLoader
 
-    class TextDataset(Dataset):
-        def __init__(self, texts, labels, tokenizer, max_length=256):
-            self.encodings = tokenizer(
-                texts, padding=True, truncation=True,
-                max_length=max_length, return_tensors="pt"
-            )
-            self.labels = torch.tensor(labels, dtype=torch.long)
-
-        def __len__(self):
-            return len(self.labels)
-
-        def __getitem__(self, idx):
-            return {
-                "input_ids":      self.encodings["input_ids"][idx],
-                "attention_mask": self.encodings["attention_mask"][idx],
-                "labels":         self.labels[idx],
-            }
-
-    tokenizer  = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
-    model      = DistilBertForSequenceClassification.from_pretrained(
-        "distilbert-base-uncased", num_labels=num_classes
+    base_model = _PRETRAINED_OPTIONS[0]  # start from BiomedBERT
+    tokenizer  = AutoTokenizer.from_pretrained(base_model)
+    model      = AutoModelForSequenceClassification.from_pretrained(
+        base_model, num_labels=num_classes, ignore_mismatched_sizes=True
     ).to(device)
 
-    train_dataset = TextDataset(train_texts, train_labels, tokenizer)
-    val_dataset   = TextDataset(val_texts,   val_labels,   tokenizer)
-    train_loader  = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader    = DataLoader(val_dataset,   batch_size=batch_size)
+    class TD(Dataset):
+        def __init__(self, texts, labels):
+            self.enc    = tokenizer(texts, padding=True, truncation=True,
+                                    max_length=128, return_tensors="pt")
+            self.labels = torch.tensor(labels, dtype=torch.long)
+        def __len__(self): return len(self.labels)
+        def __getitem__(self, i):
+            return {k: v[i] for k, v in self.enc.items()}, self.labels[i]
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    criterion = nn.CrossEntropyLoss()
+    def collate(batch):
+        items, labels = zip(*batch)
+        return {k: torch.stack([b[k] for b in items]) for k in items[0]}, torch.stack(labels)
 
-    best_val_acc = 0.0
+    tl  = DataLoader(TD(train_texts, train_labels), batch_size, shuffle=True, collate_fn=collate)
+    vl  = DataLoader(TD(val_texts,   val_labels),   batch_size, collate_fn=collate)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    best = 0.0
 
-    for epoch in range(epochs):
+    for ep in range(epochs):
         model.train()
-        for batch in train_loader:
-            input_ids      = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels         = batch["labels"].to(device)
-
-            optimizer.zero_grad()
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            loss    = criterion(outputs.logits, labels)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-
-        # Validation accuracy
-        model.eval()
-        correct, total = 0, 0
+        for enc, labs in tl:
+            opt.zero_grad()
+            loss = model(**{k:v.to(device) for k,v in enc.items()}, labels=labs.to(device)).loss
+            loss.backward(); nn.utils.clip_grad_norm_(model.parameters(),1.0); opt.step()
+        model.eval(); correct=total=0
         with torch.no_grad():
-            for batch in val_loader:
-                input_ids      = batch["input_ids"].to(device)
-                attention_mask = batch["attention_mask"].to(device)
-                labels         = batch["labels"].to(device)
-                outputs        = model(input_ids=input_ids, attention_mask=attention_mask)
-                preds          = outputs.logits.argmax(dim=-1)
-                correct       += (preds == labels).sum().item()
-                total         += labels.size(0)
-
-        val_acc = correct / total
-        print(f"Epoch {epoch+1}/{epochs} | val_acc={val_acc:.4f}")
-
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save(model.state_dict(), save_path)
-            print(f"  -> Saved to {save_path}")
-
+            for enc, labs in vl:
+                out = model(**{k:v.to(device) for k,v in enc.items()})
+                correct += (out.logits.argmax(-1).cpu()==labs).sum().item(); total+=len(labs)
+        acc = correct/total; print(f"Epoch {ep+1}/{epochs}  val_acc={acc:.4f}")
+        if acc>best:
+            best=acc; os.makedirs(str(save_path).rsplit("/",1)[0], exist_ok=True)
+            torch.save(model.state_dict(), save_path); print("  -> saved")
     return model
-
-
-# ---------------------------------------------------------------------------
-# Smoke test
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    print("=== NLP Model Smoke Test ===\n")
-
-    # Uses SST-2 fine-tuned model (binary) just to verify the pipeline works
-    # In week 2, swap this for a MedNLI fine-tuned checkpoint
-    engine = NLPInferenceEngine(
-        model_path="distilbert-base-uncased-finetuned-sst-2-english",
-        num_classes=2,
-        labels=["negative", "positive"],
-    )
-
-    # Single text (batch_size=1 — as scheduler dispatches urgent NLP requests)
-    text = "Patient presents with acute onset of shortness of breath and chest pain."
-    probs, latency = engine.infer(text)
-    print(f"Single text | Output: {probs.shape} | Latency: {latency:.2f}ms")
-    print(f"SLA (300ms): {'PASS' if latency < 300 else 'FAIL'}")
-    print()
-
-    # Batch of 8 texts (variable length — key to demonstrating padding overhead)
-    texts = [
-        "Patient is hemodynamically stable with no signs of infection.",
-        "Chest X-ray reveals bilateral infiltrates consistent with pneumonia.",
-        "Patient reports no fever.",
-        "Lab results indicate elevated troponin levels suggesting myocardial infarction.",
-        "No acute distress noted.",
-        "ECG shows ST elevation in leads II, III, and aVF.",
-        "Patient tolerating oral intake well.",
-        "Blood cultures drawn and pending. Started empiric antibiotics.",
-    ]
-
-    probs, latency = engine.infer(texts)
-    print(f"Batch of 8 | Output: {probs.shape} | Latency: {latency:.2f}ms")
-    print(f"SLA (300ms): {'PASS' if latency < 300 else 'FAIL'}")
-    print()
-
-    # Padding overhead demonstration (key insight for your paper)
-    short_texts = ["No fever."] * 8           # very short, minimal padding
-    long_texts  = [texts[5]] * 8              # long text, lots of computation
-
-    _, short_latency = engine.infer(short_texts)
-    _, long_latency  = engine.infer(long_texts)
-    print(f"Padding overhead demo:")
-    print(f"  Short texts batch (8x): {short_latency:.2f}ms")
-    print(f"  Long texts batch  (8x): {long_latency:.2f}ms")
-    print(f"  Overhead: {long_latency - short_latency:.2f}ms")
-    print(f"  This is why NLP batching strategy matters for your scheduler.")

@@ -1,300 +1,121 @@
 """
-models/imaging_model.py — ResNet18 for chest X-ray classification.
-
-Task:    Multilabel classification — detect which of 14 pathologies
-         are present in a chest X-ray.
-
-Dataset: NIH ChestX-ray14 (freely available, no credentialing needed)
-         https://nihcc.app.box.com/v/ChestXray-NIHCC
-         OR MIMIC-CXR (requires PhysioNet access, same as MIMIC-III)
-
-Input:   (batch_size, 3, 224, 224) — standard ImageNet preprocessing
-         Normalize with ImageNet mean/std (torchvision handles this)
-
-Output:  (batch_size, 14) — independent probabilities for each pathology
-         Labels: Atelectasis, Cardiomegaly, Effusion, Infiltration,
-                 Mass, Nodule, Pneumonia, Pneumothorax, Consolidation,
-                 Edema, Emphysema, Fibrosis, Pleural Thickening, Hernia
-
-SLA:     500ms (LOW priority — batch-friendly, radiology pre-screening)
-Target:  ~0.75 mean AUC across 14 labels (reasonable ResNet18 baseline)
-
-Architecture note: We use a pretrained ResNet18 and replace only the
-final FC layer. Fine-tuning the last 2 blocks + classifier is enough
-for a research baseline. Don't train from scratch — it wastes time.
+models/imaging_model.py — Chest X-ray classifier using torchxrayvision pretrained weights.
+No training required. Uses DenseNet121 trained on NIH+CheXpert+MIMIC-CXR.
+Cite: Cohen et al., TorchXRayVision, MIDL 2022.
+Install: pip install torchxrayvision
 """
 
-import time
 import torch
 import torch.nn as nn
-import torchvision.models as models
 import torchvision.transforms as transforms
-from typing import Tuple, List
+from typing import Any
+from models.base import BaseInferenceEngine, ModelMetadata
+from system.request import ModelType
 
-
-# ---------------------------------------------------------------------------
-# Label definitions
-# ---------------------------------------------------------------------------
-
-CHESTXRAY_LABELS: List[str] = [
-    "Atelectasis", "Cardiomegaly", "Effusion",    "Infiltration",
-    "Mass",        "Nodule",        "Pneumonia",   "Pneumothorax",
-    "Consolidation","Edema",        "Emphysema",   "Fibrosis",
-    "Pleural_Thickening",           "Hernia",
+LABELS = [
+    "Atelectasis","Cardiomegaly","Effusion","Infiltration","Mass","Nodule",
+    "Pneumonia","Pneumothorax","Consolidation","Edema","Emphysema",
+    "Fibrosis","Pleural_Thickening","Hernia",
 ]
-NUM_CLASSES = len(CHESTXRAY_LABELS)  # 14
 
-
-# ---------------------------------------------------------------------------
-# Standard preprocessing transform
-# ---------------------------------------------------------------------------
-
-IMAGING_TRANSFORM = transforms.Compose([
-    transforms.Resize(256),
-    transforms.CenterCrop(224),
+TRANSFORM = transforms.Compose([
+    transforms.Resize(256), transforms.CenterCrop(224),
     transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],   # ImageNet statistics
-        std=[0.229, 0.224, 0.225],
-    ),
+    transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]),
 ])
 
 
-# ---------------------------------------------------------------------------
-# Model definition
-# ---------------------------------------------------------------------------
-
-class ImagingModel(nn.Module):
+class _ImagingBackbone(nn.Module):
     """
-    Pretrained ResNet18 adapted for chest X-ray multilabel classification.
-
-    Fine-tuning strategy (week 1: use this, don't overthink):
-    1. Load ImageNet pretrained weights
-    2. Freeze all layers except layer4 and the new classifier
-    3. Replace final FC (1000 classes → 14 classes)
-    4. Use sigmoid (not softmax) — these are independent binary predictions
-
-    Why ResNet18 over ResNet50/ViT?
-    - Faster inference → easier to hit 500ms SLA
-    - Smaller memory footprint → more room for other models on same GPU
-    - Performance difference is small for a research baseline
+    Tries torchxrayvision first (best pretrained clinical weights).
+    Falls back to pretrained ResNet18 if txrv not installed.
     """
-
-    def __init__(self, num_classes: int = NUM_CLASSES, pretrained: bool = True):
+    def __init__(self):
         super().__init__()
+        try:
+            import torchxrayvision as xrv
+            self.net      = xrv.models.DenseNet(weights="densenet121-res224-all")
+            self.use_txrv = True
+            self.txrv_pathologies = self.net.pathologies
+            print("[Imaging] torchxrayvision DenseNet121 loaded (NIH+CheXpert+MIMIC-CXR pretrained)")
+        except ImportError:
+            import torchvision.models as tv
+            b = tv.resnet18(weights=tv.ResNet18_Weights.DEFAULT)
+            for p in b.parameters(): p.requires_grad = False
+            b.fc = nn.Sequential(nn.Dropout(0.3), nn.Linear(512, 14))
+            self.net      = b
+            self.use_txrv = False
+            print("[Imaging] torchxrayvision not found — using ResNet18 (pip install torchxrayvision for better weights)")
 
-        weights = models.ResNet18_Weights.DEFAULT if pretrained else None
-        backbone = models.resnet18(weights=weights)
-
-        # Freeze all layers first
-        for param in backbone.parameters():
-            param.requires_grad = False
-
-        # Unfreeze the last residual block (layer4) for fine-tuning
-        for param in backbone.layer4.parameters():
-            param.requires_grad = True
-
-        # Replace the final classifier
-        in_features = backbone.fc.in_features  # 512 for ResNet18
-        backbone.fc = nn.Sequential(
-            nn.Dropout(p=0.3),
-            nn.Linear(in_features, num_classes),
-            # No sigmoid here — use BCEWithLogitsLoss during training
-            # Sigmoid applied at inference time for probabilities
-        )
-
-        self.backbone    = backbone
-        self.num_classes = num_classes
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (batch_size, 3, 224, 224)
-        Returns:
-            logits: (batch_size, 14) — raw logits (no sigmoid)
-        """
-        return self.backbone(x)
-
-
-# ---------------------------------------------------------------------------
-# Inference engine
-# ---------------------------------------------------------------------------
-
-class ImagingInferenceEngine:
-    """
-    Wraps ImagingModel for production inference.
-    Imaging is the LOW priority workload — designed for batching.
-    Batch sizes of 8–32 are expected and efficient.
-    """
-
-    def __init__(
-        self,
-        model_path: str = None,
-        device:     str = "cuda" if torch.cuda.is_available() else "cpu",
-        use_fp16:   bool = True,
-    ):
-        self.device  = torch.device(device)
-        self.use_fp16 = use_fp16 and (device == "cuda")
-
-        self.model = ImagingModel(pretrained=True)
-
-        if model_path:
-            state = torch.load(model_path, map_location=self.device)
-            self.model.load_state_dict(state)
-            print(f"[Imaging] Loaded weights from {model_path}")
+    def forward(self, x):
+        if self.use_txrv:
+            # txrv expects (B,1,H,W) in [-1024, 1024]
+            gray   = x.mean(dim=1, keepdim=True)
+            gray   = (gray - 0.5) * 2048.0
+            raw    = self.net(gray)                   # (B, n_txrv_pathologies)
+            result = torch.zeros(x.shape[0], 14, device=x.device)
+            for i, lbl in enumerate(LABELS):
+                key = lbl.replace("_"," ").lower()
+                for j, p in enumerate(self.txrv_pathologies or []):
+                    if p and key in (p or "").lower():
+                        result[:, i] = torch.sigmoid(raw[:, j]); break
+            return result
         else:
-            print("[Imaging] No weights path — using pretrained backbone only (testing)")
+            return torch.sigmoid(self.net(x))
 
+
+class ImagingInferenceEngine(BaseInferenceEngine):
+    """ResNet/DenseNet chest X-ray classifier. Input:(B,3,224,224) Output:(B,14) SLA:500ms"""
+
+    def _load_model(self):
+        self.model = _ImagingBackbone()
+        if self.model_path:
+            try:
+                self.model.net.load_state_dict(torch.load(self.model_path, map_location=self.device))
+                print(f"[Imaging] Loaded fine-tuned weights from {self.model_path}")
+            except Exception as e:
+                print(f"[Imaging] Could not load {self.model_path} ({e}) — using pretrained")
         self.model.to(self.device)
-        self.model.eval()
 
-        if self.use_fp16:
-            self.model = self.model.half()
-            print("[Imaging] Running in FP16 mode")
+    def _forward(self, x): return self.model(x).cpu().float()
 
-    @torch.no_grad()
-    def infer(self, input_tensor: torch.Tensor) -> Tuple[torch.Tensor, float]:
-        """
-        Run inference on a batch of chest X-rays.
+    def preprocess(self, raw_input):
+        from PIL import Image
+        if isinstance(raw_input, str): raw_input = Image.open(raw_input).convert("RGB")
+        if hasattr(raw_input, "convert"): return TRANSFORM(raw_input).unsqueeze(0)
+        t = raw_input if isinstance(raw_input, torch.Tensor) else torch.tensor(raw_input, dtype=torch.float32)
+        return t.unsqueeze(0) if t.dim() == 3 else t
 
-        Args:
-            input_tensor: (batch_size, 3, 224, 224) — preprocessed images
-                          Apply IMAGING_TRANSFORM before passing here.
-
-        Returns:
-            probs:             (batch_size, 14) — probabilities for each pathology
-            inference_time_ms: wall-clock time for this inference call
-
-        Example:
-            engine = ImagingInferenceEngine()
-            x = torch.randn(8, 3, 224, 224)    # batch of 8 X-rays
-            probs, latency = engine.infer(x)
-            # probs[i, j] = probability of pathology j in patient i
-            # e.g. probs[0, 6] = probability of Pneumonia in first patient
-        """
-        t_start = time.perf_counter()
-
-        x = input_tensor.to(self.device)
-        if self.use_fp16:
-            x = x.half()
-
-        logits = self.model(x)               # (batch, 14) raw logits
-        probs  = torch.sigmoid(logits).float()  # (batch, 14) probabilities
-
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
-
-        inference_time_ms = (time.perf_counter() - t_start) * 1000
-
-        return probs.cpu(), inference_time_ms
-
-    def predict_labels(
-        self, input_tensor: torch.Tensor, threshold: float = 0.5
-    ) -> Tuple[List[List[str]], float]:
-        """
-        Convenience method: returns predicted pathology names above threshold.
-
-        Example:
-            labels, latency = engine.predict_labels(x)
-            # labels[0] = ["Atelectasis", "Effusion"] for first patient
-        """
-        probs, latency = self.infer(input_tensor)
-        batch_labels   = []
-        for sample_probs in probs:
-            detected = [
-                CHESTXRAY_LABELS[i]
-                for i, p in enumerate(sample_probs)
-                if p.item() > threshold
-            ]
-            batch_labels.append(detected)
-        return batch_labels, latency
+    @property
+    def metadata(self):
+        name = "DenseNet121-TXRVision" if getattr(getattr(self,'model',None),'use_txrv',False) else "ResNet18-pretrained"
+        return ModelMetadata(model_type=ModelType.IMAGING, model_name=name, input_shape=(3,224,224))
 
 
-# ---------------------------------------------------------------------------
-# Training helper
-# ---------------------------------------------------------------------------
-
-def train_imaging_model(
-    train_loader,
-    val_loader,
-    epochs:    int = 10,
-    lr:        float = 1e-4,     # Lower LR — we're fine-tuning, not training from scratch
-    save_path: str = "results/imaging_model.pt",
-    device:    str = "cuda" if torch.cuda.is_available() else "cpu",
-) -> ImagingModel:
-    """
-    Fine-tune ImagingModel on chest X-ray data.
-
-    DataLoader should yield:
-        x: (batch, 3, 224, 224) — preprocessed with IMAGING_TRANSFORM
-        y: (batch, 14)          — multilabel binary targets (0 or 1)
-
-    Class imbalance note: most labels are rare (Hernia ~0.2%).
-    Use pos_weight or weighted sampling — or just accept it for a research baseline.
-    Target AUC: 0.74–0.78 mean across 14 labels.
-    """
-    model     = ImagingModel(pretrained=True).to(device)
-    criterion = nn.BCEWithLogitsLoss()  # handles multilabel well
-    optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=lr, weight_decay=1e-4
-    )
-
-    best_val_loss = float("inf")
-
-    for epoch in range(epochs):
-        model.train()
-        train_loss = 0.0
-        for x, y in train_loader:
-            x, y = x.to(device), y.to(device)
-            optimizer.zero_grad()
-            loss = criterion(model(x), y.float())
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
-
-        model.eval()
-        val_loss = 0.0
+def train_imaging_model(train_loader, val_loader, epochs=10, lr=1e-4,
+                        save_path="results/weights/imaging_model.pt", device="cuda"):
+    """Optional fine-tuning. Only needed if you want domain-specific weights."""
+    import os
+    from models.imaging_model import _ImagingBackbone
+    model = _ImagingBackbone().to(device)
+    if model.use_txrv:
+        # Unfreeze last block of DenseNet for fine-tuning
+        for p in model.net.parameters(): p.requires_grad = False
+        for p in list(model.net.parameters())[-20:]: p.requires_grad = True
+    opt  = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
+    crit = nn.BCELoss()
+    best = float("inf")
+    for ep in range(epochs):
+        model.train(); tl=0.0
+        for x,y in train_loader:
+            opt.zero_grad(); loss=crit(model(x.to(device)),y.float().to(device))
+            loss.backward(); opt.step(); tl+=loss.item()
+        model.eval(); vl=0.0
         with torch.no_grad():
-            for x, y in val_loader:
-                x, y = x.to(device), y.to(device)
-                val_loss += criterion(model(x), y.float()).item()
-
-        print(f"Epoch {epoch+1:02d}/{epochs} | "
-              f"train={train_loss/len(train_loader):.4f} | "
-              f"val={val_loss/len(val_loader):.4f}")
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), save_path)
-            print(f"  -> Saved to {save_path}")
-
+            for x,y in val_loader: vl+=crit(model(x.to(device)),y.float().to(device)).item()
+        tl/=len(train_loader); vl/=len(val_loader)
+        print(f"Epoch {ep+1}/{epochs}  train={tl:.4f}  val={vl:.4f}")
+        if vl<best:
+            best=vl; os.makedirs(str(save_path).rsplit("/",1)[0],exist_ok=True)
+            torch.save(model.state_dict(),save_path); print("  -> saved")
     return model
-
-
-# ---------------------------------------------------------------------------
-# Smoke test
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    print("=== Imaging Model Smoke Test ===\n")
-
-    engine = ImagingInferenceEngine(model_path=None)
-
-    # Test with batch_size=1 (single image, as HIGH priority urgent dispatch would send)
-    single = torch.randn(1, 3, 224, 224)
-    probs, latency = engine.infer(single)
-    print(f"Single image | Output: {probs.shape} | Latency: {latency:.2f}ms")
-    print(f"SLA (500ms): {'PASS' if latency < 500 else 'FAIL'}")
-    print()
-
-    # Test with batch_size=16 (normal batch dispatch)
-    batch = torch.randn(16, 3, 224, 224)
-    probs, latency = engine.infer(batch)
-    print(f"Batch of 16  | Output: {probs.shape} | Latency: {latency:.2f}ms")
-    print(f"SLA (500ms): {'PASS' if latency < 500 else 'FAIL'}")
-    print()
-
-    # Show label predictions for one sample
-    labels, _ = engine.predict_labels(single, threshold=0.3)
-    print(f"Detected pathologies (threshold=0.3): {labels[0] or ['None detected']}")
