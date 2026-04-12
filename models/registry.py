@@ -1,18 +1,9 @@
 """
-models/registry.py — MedServe Model Registry (FIXED VERSION)
-
-Key fixes:
-- Prevents accidental HuggingFace downloads during warmup
-- Safe handling of missing weights
-- Robust batch inference (ICU / Imaging / NLP separated correctly)
-- No hidden side-effects in default()
+models/registry.py — MedServe model registry (FIXED for NLP compatibility)
 """
 
-import json
-import time
 from pathlib import Path
-from typing import Dict, List, Tuple
-
+from typing import Dict, List, Optional, Tuple
 import torch
 
 from system.request import Request, ModelType
@@ -23,117 +14,100 @@ class ModelRegistry:
 
     def __init__(self):
         self._engines: Dict[ModelType, BaseInferenceEngine] = {}
-        self._call_counts = {t: 0 for t in ModelType}
-        self._total_latency = {t: 0.0 for t in ModelType}
+        self._calls = {t: 0 for t in ModelType}
+        self._latency = {t: 0.0 for t in ModelType}
 
     # ---------------------------------------------------------
     # Register
     # ---------------------------------------------------------
+
     def register(self, engine: BaseInferenceEngine):
         mtype = engine.metadata.model_type
 
         if mtype in self._engines:
             print(f"[Registry] Replacing {mtype.value}")
+        else:
+            print(f"[Registry] Registered {engine.metadata.model_name} for {mtype.value}")
 
         self._engines[mtype] = engine
-
-        print(
-            f"[Registry] Registered {engine.metadata.model_name} "
-            f"for {mtype.value} (SLA={engine.metadata.sla_ms}ms)"
-        )
         return self
 
+    def swap(self, model_type: ModelType, engine: BaseInferenceEngine):
+        return self.register(engine)
+
     # ---------------------------------------------------------
-    # Default setup (SAFE)
+    # Default registry
     # ---------------------------------------------------------
+
     @classmethod
     def default(
         cls,
-        weights_dir="results/weights",
-        device="cuda" if torch.cuda.is_available() else "cpu",
-        use_fp16=True,
+        weights_dir: str = "results/weights",
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        use_fp16: bool = True,
     ):
 
         from models.icu_model import ICUInferenceEngine
         from models.imaging_model import ImagingInferenceEngine
         from models.nlp_model import NLPInferenceEngine
 
-        weights = Path(weights_dir)
+        w = Path(weights_dir)
 
-        def get_path(name: str):
-            p = weights / name
-            return str(p) if p.exists() else None
+        def p(name): 
+            return str(w / name) if (w / name).exists() else None
 
-        registry = cls()
+        r = cls()
 
-        # ---------------- ICU ----------------
-        registry.register(ICUInferenceEngine(
-            model_path=get_path("icu_model.pt"),
+        # ICU
+        r.register(ICUInferenceEngine(
+            model_path=p("icu_model.pt"),
             device=device,
             use_fp16=use_fp16,
         ))
 
-        # ---------------- Imaging ----------------
-        registry.register(ImagingInferenceEngine(
-            model_path=get_path("imaging_model.pt"),
+        # Imaging
+        r.register(ImagingInferenceEngine(
+            model_path=p("imaging_model.pt"),
             device=device,
             use_fp16=use_fp16,
         ))
 
-        # ---------------- NLP (CRITICAL FIX) ----------------
-        nlp_path = get_path("nlp_model.pt")
-
-        registry.register(NLPInferenceEngine(
-            model_path=nlp_path,
+        # NLP (FIXED: no extra args like local_only)
+        r.register(NLPInferenceEngine(
+            model_path=p("nlp_model.pt"),
             device=device,
             use_fp16=use_fp16,
-
-            # IMPORTANT FLAG (you must support this in NLP engine)
-            local_only=nlp_path is not None
         ))
 
-        return registry
+        return r
 
     # ---------------------------------------------------------
-    # Warmup (NO NETWORK CALLS ALLOWED)
+    # Warmup
     # ---------------------------------------------------------
-    def warmup_all(self, n_runs: int = 5):
-        print("\n[Registry] Warming up all engines...")
 
-        for engine in self._engines.values():
-
-            try:
-                # NEVER let warmup trigger HF downloads
-                engine.warmup(n_runs=n_runs)
-
-                # only imaging/icu benefit from batch benchmark
-                if engine.metadata.model_type != ModelType.NLP:
-                    engine.benchmark_batch_sizes()
-
-            except Exception as e:
-                print(f"[Registry] Warmup skipped for {engine.metadata.model_name}: {e}")
-
-        print("[Registry] All engines ready.\n")
+    def warmup_all(self, n_runs=5):
+        print("\n[Registry] Warming up...")
+        for e in self._engines.values():
+            if hasattr(e, "warmup"):
+                e.warmup(n_runs=n_runs)
+        print("[Registry] Ready.\n")
 
     # ---------------------------------------------------------
-    # Single inference
+    # Inference
     # ---------------------------------------------------------
-    def infer(self, request: Request) -> Tuple[torch.Tensor, float]:
+
+    def infer(self, request: Request):
         engine = self._engines[request.model_type]
+        out, latency = engine.infer(request.input_tensor)
 
-        result, latency = engine.infer(request.input_tensor)
+        request.mark_complete(out, latency)
 
-        request.mark_complete(result, latency)
+        self._calls[request.model_type] += 1
+        self._latency[request.model_type] += latency
 
-        self._record(request.model_type, latency)
+        return out, latency
 
-        return result, latency
-
-    # ---------------------------------------------------------
-    # Batch inference (FIXED NLP handling)
-    # ---------------------------------------------------------
     def infer_batch(self, requests: List[Request]):
-
         if not requests:
             return []
 
@@ -144,54 +118,38 @@ class ModelRegistry:
         results = [None] * len(requests)
 
         for mtype, items in grouped.items():
-
             engine = self._engines[mtype]
 
-            batch_inputs = [r.input_tensor for _, r in items]
+            idxs = [i for i, _ in items]
+            reqs = [r for _, r in items]
 
-            # ---------------- NLP SPECIAL CASE ----------------
-            if mtype == ModelType.NLP:
-                batch_result, latency = engine.infer(batch_inputs)
-            else:
-                batch_tensor = torch.stack(batch_inputs)
-                batch_result, latency = engine.infer(batch_tensor)
+            inputs = [r.input_tensor for r in reqs]
 
-            # distribute results
-            for k, (idx, req) in enumerate(items):
-                req.mark_complete(batch_result[k], latency)
-                self._record(mtype, latency)
-                results[idx] = (batch_result[k], latency)
+            batch_out, latency = engine.infer(inputs)
+
+            for k, req in enumerate(reqs):
+                out = batch_out[k] if batch_out.ndim > 1 else batch_out
+                req.mark_complete(out, latency)
+
+                results[idxs[k]] = (out, latency)
+
+                self._calls[mtype] += 1
+                self._latency[mtype] += latency
 
         return results
 
     # ---------------------------------------------------------
     # Stats
     # ---------------------------------------------------------
-    def _record(self, mtype, latency):
-        self._call_counts[mtype] += 1
-        self._total_latency[mtype] += latency
 
     def stats(self):
         return {
             t.value: {
-                "requests": self._call_counts[t],
+                "requests": self._calls[t],
                 "avg_latency_ms": (
-                    self._total_latency[t] / self._call_counts[t]
-                    if self._call_counts[t] > 0 else 0
-                ),
+                    self._latency[t] / self._calls[t]
+                    if self._calls[t] else 0
+                )
             }
-            for t in ModelType
-            if self._call_counts[t] > 0
+            for t in self._engines
         }
-
-    def registered_types(self):
-        return list(self._engines.keys())
-
-    def is_registered(self, model_type: ModelType):
-        return model_type in self._engines
-
-    def __repr__(self):
-        return "ModelRegistry(" + ", ".join(
-            f"{t.value}:{e.metadata.model_name}"
-            for t, e in self._engines.items()
-        ) + ")"
