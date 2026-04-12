@@ -1,0 +1,203 @@
+# MedServe Setup Guide
+
+Complete workflow: **local dev → Kaggle GPU training → GitHub sync → local testing**
+
+---
+
+## Architecture
+
+```
+Your laptop (CPU)                    Kaggle (free GPU T4)
+─────────────────                    ────────────────────
+system/server.py  ←── git pull ───  train_all_models.ipynb
+scripts/test_*.py                        │
+experiments/       ── git push ──→  results/weights/*.pt
+                                         │
+                               GitHub repo (stores weights)
+```
+
+---
+
+## Step 1: Initial local setup
+
+```bash
+# Clone your repo
+git clone https://github.com/YOUR_USERNAME/medserve.git
+cd medserve
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Create required directories
+mkdir -p results/weights results/plots results/logs paper
+
+# Verify the codebase works (uses random weights — no GPU needed)
+python experiments/week1_smoke_test.py
+```
+
+Expected output: all tests PASS (latencies will be slow on CPU — that's fine).
+
+---
+
+## Step 2: GitHub repository setup
+
+```bash
+# Initialize repo if you haven't already
+git init
+git add .
+git commit -m "Initial MedServe codebase"
+git remote add origin https://github.com/YOUR_USERNAME/medserve.git
+git push -u origin main
+```
+
+Add `results/weights/*.pt` to git tracking (not .gitignore):
+```bash
+# Remove weights from .gitignore if present
+echo "!results/weights/*.pt" >> .gitignore
+echo "!results/model_metadata.json" >> .gitignore
+git add .gitignore && git commit -m "Track model weights in repo"
+```
+
+---
+
+## Step 3: Kaggle secrets setup
+
+In Kaggle → Account → Secrets, add:
+
+| Secret name       | Value                          |
+|-------------------|--------------------------------|
+| `GITHUB_TOKEN`    | Your GitHub personal access token (repo scope) |
+| `GITHUB_USERNAME` | Your GitHub username           |
+| `GITHUB_REPO`     | `medserve`                     |
+
+**Create GitHub token:** github.com → Settings → Developer settings →
+Personal access tokens → Generate new token → select `repo` scope.
+
+---
+
+## Step 4: Kaggle notebook setup
+
+1. Go to kaggle.com → Create → New Notebook
+2. Paste contents of `kaggle/train_all_models.ipynb` (or upload the file)
+3. In Settings → Accelerator: select **GPU T4 x1**
+4. Add these datasets in the Data tab:
+   - **NIH Chest X-rays:** search "nih-chest-xrays" → add dataset
+   - **Sepsis Prediction:** search "prediction-of-sepsis" → add dataset
+5. Run all cells (~45 minutes total)
+
+**What Kaggle does:**
+- Clones your GitHub repo into `/kaggle/working/medserve`
+- Trains all three models on T4 GPU
+- Saves weights to `/kaggle/working/weights/`
+- Pushes weights back to your GitHub repo
+- Benchmarks latency and saves `results/model_metadata.json`
+
+---
+
+## Step 5: Sync weights to local machine
+
+After Kaggle finishes:
+
+```bash
+# Pull trained weights from GitHub
+python scripts/sync_weights.py
+
+# You should see:
+#   ✓ OK    icu_model.pt      (X.X MB)
+#   ✓ OK    imaging_model.pt  (X.X MB)
+#   ✓ OK    nlp_model.pt      (X.X MB)
+```
+
+---
+
+## Step 6: Start local server and test
+
+```bash
+# Terminal 1 — start the server
+python system/server.py
+
+# Terminal 2 — run integration tests
+python scripts/test_local_server.py
+```
+
+The server runs on CPU locally. Latencies will be slower than GPU benchmarks,
+but the API, scheduler logic, and batching behavior are fully testable.
+
+---
+
+## Step 7: Iterative development workflow
+
+```
+Edit model or scheduler code locally
+        ↓
+python scripts/test_local_server.py    ← fast local test (CPU)
+        ↓
+git push origin main
+        ↓
+Re-run Kaggle notebook (or just the affected training cell)
+        ↓
+python scripts/sync_weights.py
+        ↓
+python experiments/benchmarks.py      ← uses real GPU latencies from metadata
+```
+
+---
+
+## Adding a new model (pluggable interface)
+
+```python
+# 1. Create models/my_new_model.py — subclass BaseInferenceEngine
+from models.base import BaseInferenceEngine, ModelMetadata
+from system.request import ModelType
+
+class MyNewICUEngine(BaseInferenceEngine):
+    def _load_model(self): ...
+    def _forward(self, x): ...
+    def preprocess(self, raw): ...
+
+    @property
+    def metadata(self):
+        return ModelMetadata(
+            model_type=ModelType.ICU,
+            model_name="MyNewModel-v1",
+            input_shape=(48, 34),
+        )
+
+# 2. Register it — zero changes to scheduler or server
+from models.registry import ModelRegistry
+registry = ModelRegistry.default()
+registry.swap(ModelType.ICU, MyNewICUEngine(model_path="results/weights/my_model.pt"))
+
+# 3. Hot-swap at runtime via API
+curl -X POST http://localhost:8000/registry/swap \
+     -d '{"model_type":"icu","model_class":"MyNewICUEngine","module":"my_new_model"}'
+```
+
+---
+
+## Key URLs
+
+- Local server:    http://localhost:8000
+- API docs:        http://localhost:8000/docs   (auto-generated by FastAPI)
+- Metrics:         http://localhost:8000/metrics
+- Health:          http://localhost:8000/health
+
+---
+
+## Troubleshooting
+
+**Kaggle push fails:**
+- Check your GITHUB_TOKEN has `repo` write scope
+- Make sure the repo exists and you have push access
+
+**Weights not found locally:**
+- Run `python scripts/sync_weights.py` after Kaggle completes
+- Check that `PUSH_TO_GITHUB = True` was set in the notebook
+
+**Server won't start:**
+- `pip install -r requirements.txt`
+- Check port 8000 is free: `lsof -i :8000`
+
+**Model accuracy is low:**
+- Increase `ICU_EPOCHS`, `IMAGING_EPOCHS`, or `NLP_EPOCHS` in the notebook
+- For ICU: check class imbalance — sepsis rate should print during loading

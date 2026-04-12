@@ -1,0 +1,66 @@
+name: MedServe CI — Validate weights + run smoke tests
+
+on:
+  push:
+    paths:
+      - 'results/weights/**'   # triggers when Kaggle pushes new weights
+      - 'models/**'
+      - 'system/**'
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        run: |
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install transformers fastapi uvicorn pydantic requests
+          pip install pytest
+
+      - name: Check weight files exist
+        run: |
+          echo "Checking for trained weights..."
+          ls -lh results/weights/ || echo "No weights yet — first training run"
+
+      - name: Run model smoke tests (CPU)
+        run: |
+          cd $GITHUB_WORKSPACE
+          python experiments/week1_smoke_test.py
+
+      - name: Validate model metadata
+        run: |
+          if [ -f results/model_metadata.json ]; then
+            echo "Model metadata found:"
+            cat results/model_metadata.json
+          else
+            echo "No metadata yet (run Kaggle notebook to generate)"
+          fi
+
+      - name: Report weight file sizes
+        if: always()
+        run: |
+          echo "=== Weight file sizes ==="
+          for f in icu_model.pt imaging_model.pt nlp_model.pt; do
+            if [ -f "results/weights/$f" ]; then
+              ls -lh "results/weights/$f"
+            else
+              echo "$f: NOT FOUND"
+            fi
+          done
