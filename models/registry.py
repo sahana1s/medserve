@@ -69,7 +69,7 @@ class ModelRegistry:
         r.register(ImagingInferenceEngine(
             model_path=p("imaging_model.pt"),
             device=device,
-            use_fp16=use_fp16,
+            use_fp16=False,
         ))
 
         # NLP (FIXED: no extra args like local_only)
