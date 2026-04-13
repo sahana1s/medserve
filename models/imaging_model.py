@@ -77,7 +77,11 @@ class ImagingInferenceEngine(BaseInferenceEngine):
                 print(f"[Imaging] Could not load {self.model_path} ({e}) — using pretrained")
         self.model.to(self.device)
 
-    def _forward(self, x): return self.model(x).cpu().float()
+    # def _forward(self, x): return self.model(x).cpu().float()
+    def _forward(self, x):
+        # FORCE FP32 — torchxrayvision breaks in FP16
+        x = x.to(torch.float32)
+        return self.model(x).cpu().float()
 
     def preprocess(self, raw_input):
         from PIL import Image
