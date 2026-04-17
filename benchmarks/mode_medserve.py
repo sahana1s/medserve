@@ -13,7 +13,7 @@ Scheduler algorithm (paper section 3.2):
     4. Adaptive batching: if HIGH queue pressure, halve batch size for LOW/MID work
     5. Aging: multiply urgency by AGING_FACTOR every AGING_INTERVAL_S of waiting
 
-Hyperparameters (tune these in week 7):
+Hyperparameters (initial):
     TICK_MS           = 10       scheduling interval
     ALPHA             = 1.5      dispatch threshold multiplier
     MAX_BATCH         = 16       maximum batch size
@@ -48,12 +48,12 @@ class SchedulerConfig:
     All tunable hyperparameters in one place.
     Change these for sensitivity analysis experiments.
     """
-    TICK_MS:            float = 10.0    # scheduling loop interval
-    ALPHA:              float = 1.5     # dispatch when time_remaining < ALPHA * avg_inf_ms
-    MAX_BATCH:          int   = 16      # max requests per dispatch
-    HIGH_PRESSURE_THR:  int   = 3       # ICU queue depth → halve batch size
-    AGING_FACTOR:       float = 1.2     # urgency multiplier per aging interval
-    AGING_INTERVAL_S:   float = 2.0     # how often aging is applied
+    TICK_MS:            float = 3.0    # scheduling loop interval
+    ALPHA:              float = 0.85     # dispatch when time_remaining < ALPHA * avg_inf_ms
+    MAX_BATCH:          int   = 12      # max requests per dispatch
+    HIGH_PRESSURE_THR:  int   = 2       # ICU queue depth → halve batch size
+    AGING_FACTOR:       float = 1.6     # urgency multiplier per aging interval
+    AGING_INTERVAL_S:   float = 1.0     # how often aging is applied
     TIER_WEIGHTS: Dict  = None          # HIGH/MID/LOW urgency base weights
 
     def __init__(self, **kwargs):
