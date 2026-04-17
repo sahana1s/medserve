@@ -116,7 +116,13 @@ class MedServeScheduler:
         self._results: Dict[str, tuple] = {}    # request_id → (result, inf_ms)
         self._result_events: Dict[str, threading.Event] = {}
         self._last_aging   = time.perf_counter()
-        self._avg_inf_ms: Dict[str, float] = {"icu": 20.0, "nlp": 80.0, "imaging": 150.0}
+        # self._avg_inf_ms: Dict[str, float] = {"icu": 20.0, "nlp": 80.0, "imaging": 150.0}
+        # Start with warmup-derived values, not guesses
+        self._avg_inf_ms: Dict[str, float] = {
+            "icu": 80.0,      # realistic T4 estimate
+            "nlp": 150.0,
+            "imaging": 200.0,
+        }
 
     def submit(self, req: WorkloadRequest) -> threading.Event:
         """Add a request to the appropriate priority queue. Returns an Event that fires on completion."""
@@ -173,39 +179,52 @@ class MedServeScheduler:
             self._last_aging = now
 
     def _dispatch_one_cycle(self):
-        """
-        One scheduling decision cycle. Called every TICK_MS.
-
-        Algorithm:
-        1. Check for CRITICAL requests (deadline imminent) → dispatch immediately
-        2. Compute adaptive batch size based on ICU queue pressure
-        3. Select top-k by urgency score → dispatch as batch
-        """
-        # --- Step 1: Emergency dispatch for critical requests ---
-        critical = self._find_critical()
-        if critical:
-            self._dispatch(critical)
-            return
-
-        # --- Step 2: Compute adaptive batch size ---
+        # --- Step 1: Emergency dispatch — per type, grouped ---
+        critical_by_type: Dict[str, List[QueuedRequest]] = defaultdict(list)
+        for mtype, queue in self.queues.items():
+            avg_ms = self._avg_inf_ms.get(mtype, 50.0)
+            for qr in queue:
+                if qr.time_remaining_ms < self.config.ALPHA * avg_ms:
+                    critical_by_type[mtype].append(qr)
+    
+        if critical_by_type:
+            # Dispatch only the highest-priority type's critical requests
+            # Priority order: icu > nlp > imaging
+            for mtype in ("icu", "nlp", "imaging"):
+                if mtype in critical_by_type:
+                    self._dispatch(critical_by_type[mtype])
+                    return
+    
+        # --- Step 2: Adaptive batch size ---
         batch_size = self._compute_batch_size()
-
-        # --- Step 3: Select highest-urgency candidates ---
-        all_queued = [qr for q in self.queues.values() for qr in q]
-        if not all_queued:
+    
+        # --- Step 3: Per-type urgency batching ---
+        # Find the model type with the highest-urgency head request
+        best_type = None
+        best_urgency = -1.0
+        for mtype, queue in self.queues.items():
+            if not queue:
+                continue
+            # Use the max urgency request in this type's queue as the representative
+            top_urgency = max(qr.urgency for qr in queue)
+            if top_urgency > best_urgency:
+                best_urgency = top_urgency
+                best_type = mtype
+    
+        if best_type is None:
             return
-
-        # Sort by urgency descending, take top batch_size
-        candidates = sorted(all_queued, key=lambda r: r.urgency, reverse=True)[:batch_size]
-
-        # Only dispatch if we have a full batch OR any request is nearly expired
+    
+        queue = self.queues[best_type]
+        # Sort this type's queue by urgency, take up to batch_size
+        candidates = sorted(queue, key=lambda r: r.urgency, reverse=True)[:batch_size]
+    
         nearly_expired = any(
-            qr.time_remaining_ms < self.config.ALPHA * self._avg_inf_ms.get(qr.req.model_type, 50.0)
+            qr.time_remaining_ms < self.config.ALPHA * self._avg_inf_ms.get(best_type, 50.0)
             for qr in candidates
         )
-        if len(candidates) >= batch_size or nearly_expired:
+        if len(queue) >= batch_size or nearly_expired:
             self._dispatch(candidates)
-
+        
     def _find_critical(self) -> List[QueuedRequest]:
         """Find requests whose deadline is within ALPHA * avg_inference_time."""
         critical = []
