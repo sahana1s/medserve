@@ -35,6 +35,10 @@ class ModelRegistry:
     def swap(self, model_type: ModelType, engine: BaseInferenceEngine):
         return self.register(engine)
 
+    # added
+    def get_metadata(self, model_type: ModelType) -> ModelMetadata:
+        return self._engines[model_type].metadata
+
     # ---------------------------------------------------------
     # Default registry
     # ---------------------------------------------------------
