@@ -23,7 +23,10 @@ LOAD_RATES   = {LoadLevel.LOW: 5.0, LoadLevel.MEDIUM: 20.0, LoadLevel.HIGH: 50.0
 DEFAULT_MIX  = {"icu": 0.20, "nlp": 0.30, "imaging": 0.50}
 ICU_HEAVY    = {"icu": 0.50, "nlp": 0.25, "imaging": 0.25}
 BALANCED_MIX = {"icu": 0.33, "nlp": 0.34, "imaging": 0.33}
-SLA_MS       = {"icu": 100,  "nlp": 300,  "imaging": 500}
+# SLA_MS       = {"icu": 100,  "nlp": 300,  "imaging": 500}
+SLA_MS = {"icu": 250, "nlp": 500, "imaging": 1000}
+# Rationale: 2.5–3× median GPU inference time, matching NVIDIA's 
+# recommended headroom for priority inference workloads
 
 
 @dataclass
