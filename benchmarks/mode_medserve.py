@@ -275,7 +275,7 @@ class MedServeScheduler:
         # Dispatch if: batch is full, OR head request has used >50% of its SLA budget
         head_qr  = min(queue, key=lambda r: r.req.sent_at_ms)
         elapsed  = (time.perf_counter() * 1000.0) - head_qr.req.sent_at_ms
-        budget_half_consumed = elapsed > (head_qr.req.sla_ms * 0.5)
+        budget_half_consumed = elapsed > (head_qr.req.sla_ms * 0.3)
     
         if len(queue) >= batch_size or budget_half_consumed:
             self._dispatch(candidates)
