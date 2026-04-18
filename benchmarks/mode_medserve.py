@@ -137,82 +137,162 @@ class MedServeScheduler:
                     qr.apply_aging()
             self._last_aging = now
 
+    # def _dispatch_one_cycle(self):
+    #     """
+    #     Fixed dispatch logic:
+
+    #     STEP 1 — Emergency dispatch.
+    #         Threshold = ALPHA * avg_inf_ms + SAFETY_MARGIN_MS + TICK_MS
+    #         With ALPHA=1.5, ICU threshold = 1.5*80 + 10 + 3 = 133ms remaining.
+    #         This gives 133ms of runway for an 80ms inference — plenty of headroom.
+    #         Previous bug: ALPHA=0.85 → threshold=68ms < 80ms inference → always violated.
+
+    #     STEP 2 — Proactive dispatch for ICU even when not yet critical.
+    #         If any ICU request is in queue AND scheduler is not busy with higher-urgency work,
+    #         dispatch it immediately rather than waiting for it to become critical.
+    #         This is the key insight: for 80ms inference + 250ms SLA, a request that arrives
+    #         and waits even 1 tick (3ms) needs to be dispatched within 170ms. Don't wait.
+
+    #     STEP 3 — Urgency-sorted batch dispatch for non-critical work.
+    #     """
+
+    #     # --- STEP 1: Emergency dispatch (deadline imminent) ---
+    #     for mtype in ("icu", "nlp", "imaging"):   # priority order
+    #         queue = self.queues[mtype]
+    #         if not queue:
+    #             continue
+    #         avg_ms    = self._avg_inf_ms[mtype]
+    #         # FIXED threshold: must be > avg_inf_ms to dispatch before deadline expires
+    #         threshold = self.config.ALPHA * avg_ms + self.config.SAFETY_MARGIN_MS + self.config.TICK_MS
+    #         critical  = [qr for qr in queue if qr.time_remaining_ms < threshold]
+    #         if critical:
+    #             self._dispatch(critical)
+    #             return   # one dispatch per tick
+
+    #     # --- STEP 2: Proactive ICU dispatch ---
+    #     # ICU requests should NEVER sit in queue longer than needed.
+    #     # As soon as there's an ICU request and the urgency score makes it the top type,
+    #     # dispatch it immediately — don't wait to fill a batch.
+    #     if self.queues["icu"]:
+    #         batch_size = self._compute_batch_size()
+    #         candidates = sorted(self.queues["icu"], key=lambda r: r.urgency, reverse=True)
+    #         self._dispatch(candidates[:batch_size])
+    #         return
+
+    #     # --- STEP 3: Normal urgency-sorted batch dispatch ---
+    #     batch_size = self._compute_batch_size()
+
+    #     # Find type with highest-urgency head request
+    #     best_type    = None
+    #     best_urgency = -1.0
+    #     for mtype, queue in self.queues.items():
+    #         if not queue:
+    #             continue
+    #         top_urgency = max(qr.urgency for qr in queue)
+    #         if top_urgency > best_urgency:
+    #             best_urgency = top_urgency
+    #             best_type    = mtype
+
+    #     if best_type is None:
+    #         return
+
+    #     queue      = self.queues[best_type]
+    #     candidates = sorted(queue, key=lambda r: r.urgency, reverse=True)[:batch_size]
+
+    #     # Dispatch when batch is full OR any candidate is getting close
+    #     avg_ms    = self._avg_inf_ms[best_type]
+    #     threshold = self.config.ALPHA * avg_ms + self.config.SAFETY_MARGIN_MS
+    #     nearly_expired = any(qr.time_remaining_ms < threshold for qr in candidates)
+
+    #     if len(queue) >= batch_size or nearly_expired:
+    #         self._dispatch(candidates)
     def _dispatch_one_cycle(self):
         """
-        Fixed dispatch logic:
-
-        STEP 1 — Emergency dispatch.
-            Threshold = ALPHA * avg_inf_ms + SAFETY_MARGIN_MS + TICK_MS
-            With ALPHA=1.5, ICU threshold = 1.5*80 + 10 + 3 = 133ms remaining.
-            This gives 133ms of runway for an 80ms inference — plenty of headroom.
-            Previous bug: ALPHA=0.85 → threshold=68ms < 80ms inference → always violated.
-
-        STEP 2 — Proactive dispatch for ICU even when not yet critical.
-            If any ICU request is in queue AND scheduler is not busy with higher-urgency work,
-            dispatch it immediately rather than waiting for it to become critical.
-            This is the key insight: for 80ms inference + 250ms SLA, a request that arrives
-            and waits even 1 tick (3ms) needs to be dispatched within 170ms. Don't wait.
-
-        STEP 3 — Urgency-sorted batch dispatch for non-critical work.
+        Fixed: deadline-aware dispatch that protects ICU without starving NLP/imaging.
+        
+        Key insight: dispatch the type whose head request has the LEAST remaining
+        time relative to its inference cost. This naturally prioritizes ICU when
+        it's urgent without monopolizing the GPU when it isn't.
         """
-
-        # --- STEP 1: Emergency dispatch (deadline imminent) ---
-        for mtype in ("icu", "nlp", "imaging"):   # priority order
-            queue = self.queues[mtype]
-            if not queue:
-                continue
-            avg_ms    = self._avg_inf_ms[mtype]
-            # FIXED threshold: must be > avg_inf_ms to dispatch before deadline expires
-            threshold = self.config.ALPHA * avg_ms + self.config.SAFETY_MARGIN_MS + self.config.TICK_MS
-            critical  = [qr for qr in queue if qr.time_remaining_ms < threshold]
-            if critical:
-                self._dispatch(critical)
-                return   # one dispatch per tick
-
-        # --- STEP 2: Proactive ICU dispatch ---
-        # ICU requests should NEVER sit in queue longer than needed.
-        # As soon as there's an ICU request and the urgency score makes it the top type,
-        # dispatch it immediately — don't wait to fill a batch.
-        if self.queues["icu"]:
-            batch_size = self._compute_batch_size()
-            candidates = sorted(self.queues["icu"], key=lambda r: r.urgency, reverse=True)
-            self._dispatch(candidates[:batch_size])
-            return
-
-        # --- STEP 3: Normal urgency-sorted batch dispatch ---
-        batch_size = self._compute_batch_size()
-
-        # Find type with highest-urgency head request
-        best_type    = None
-        best_urgency = -1.0
+    
+        # --- STEP 1: Emergency dispatch — any type with imminent deadline ---
+        # Check all types, dispatch the most urgent one
+        most_urgent_qr  = None
+        most_urgent_type = None
+    
         for mtype, queue in self.queues.items():
             if not queue:
                 continue
-            top_urgency = max(qr.urgency for qr in queue)
-            if top_urgency > best_urgency:
-                best_urgency = top_urgency
-                best_type    = mtype
-
+            avg_ms    = self._avg_inf_ms[mtype]
+            threshold = self.config.ALPHA * avg_ms + self.config.SAFETY_MARGIN_MS + self.config.TICK_MS
+            for qr in queue:
+                if qr.time_remaining_ms < threshold:
+                    if most_urgent_qr is None or qr.urgency > most_urgent_qr.urgency:
+                        most_urgent_qr   = qr
+                        most_urgent_type = mtype
+    
+        if most_urgent_qr is not None:
+            # Dispatch all critical requests of this type as a batch
+            avg_ms    = self._avg_inf_ms[most_urgent_type]
+            threshold = self.config.ALPHA * avg_ms + self.config.SAFETY_MARGIN_MS + self.config.TICK_MS
+            critical  = [qr for qr in self.queues[most_urgent_type]
+                         if qr.time_remaining_ms < threshold]
+            self._dispatch(critical)
+            return
+    
+        # --- STEP 2: Proactive dispatch based on deadline urgency ---
+        # Pick the type whose head request has consumed the most of its SLA budget.
+        # This is different from urgency score — it's about proportional time consumed.
+        # A NLP request that has used 280ms of its 300ms SLA is more urgent than
+        # an ICU request that has used 5ms of its 100ms SLA, even though ICU has
+        # higher tier weight.
+        
+        best_type       = None
+        best_consumed   = -1.0   # fraction of SLA budget consumed
+    
+        for mtype, queue in self.queues.items():
+            if not queue:
+                continue
+            # Look at the head request (oldest = most time consumed)
+            head_qr      = min(queue, key=lambda r: r.req.sent_at_ms)
+            sla          = head_qr.req.sla_ms
+            elapsed      = (time.perf_counter() * 1000.0) - head_qr.req.sent_at_ms
+            # Weight by tier so ICU still gets preference when budget consumption is similar
+            tier_weight  = self.config.TIER_WEIGHTS.get(mtype, 1.0)
+            weighted     = (elapsed / sla) * tier_weight
+    
+            if weighted > best_consumed:
+                best_consumed = weighted
+                best_type     = mtype
+    
         if best_type is None:
             return
-
+    
+        batch_size = self._compute_batch_size()
         queue      = self.queues[best_type]
         candidates = sorted(queue, key=lambda r: r.urgency, reverse=True)[:batch_size]
-
-        # Dispatch when batch is full OR any candidate is getting close
-        avg_ms    = self._avg_inf_ms[best_type]
-        threshold = self.config.ALPHA * avg_ms + self.config.SAFETY_MARGIN_MS
-        nearly_expired = any(qr.time_remaining_ms < threshold for qr in candidates)
-
-        if len(queue) >= batch_size or nearly_expired:
+    
+        # Dispatch if: batch is full, OR head request has used >50% of its SLA budget
+        head_qr  = min(queue, key=lambda r: r.req.sent_at_ms)
+        elapsed  = (time.perf_counter() * 1000.0) - head_qr.req.sent_at_ms
+        budget_half_consumed = elapsed > (head_qr.req.sla_ms * 0.5)
+    
+        if len(queue) >= batch_size or budget_half_consumed:
             self._dispatch(candidates)
+
+    # def _compute_batch_size(self) -> int:
+    #     icu_pressure = len(self.queues["icu"])
+    #     if icu_pressure >= self.config.HIGH_PRESSURE_THR:
+    #         return max(1, self.config.MAX_BATCH // 2)
+    #     if icu_pressure > 0:
+    #         return max(2, self.config.MAX_BATCH // 4)
+    #     return self.config.MAX_BATCH
 
     def _compute_batch_size(self) -> int:
         icu_pressure = len(self.queues["icu"])
         if icu_pressure >= self.config.HIGH_PRESSURE_THR:
             return max(1, self.config.MAX_BATCH // 2)
-        if icu_pressure > 0:
-            return max(2, self.config.MAX_BATCH // 4)
+        # Don't reduce batch size unless ICU is actually backed up
         return self.config.MAX_BATCH
 
     def _dispatch(self, candidates: List[QueuedRequest]):
