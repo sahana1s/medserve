@@ -77,6 +77,7 @@ class TritonModelConfig:
         self.max_batch_size     = max_batch_size
         self.max_queue_delay_ms = max_queue_delay_ms
         self.priority           = priority
+        self._gpu_lock = threading.Lock()  # simulates single GPU serialization
 
 
 # Triton config for each workload — matches what a Triton admin would set
@@ -85,7 +86,7 @@ class TritonModelConfig:
 TRITON_CONFIGS = {
     "icu":     TritonModelConfig("icu_model",     max_batch_size=16, max_queue_delay_ms=80,  priority=9),
     "imaging": TritonModelConfig("imaging_model", max_batch_size=16, max_queue_delay_ms=400, priority=3),
-    "nlp":     TritonModelConfig("nlp_model",     max_batch_size=8,  max_queue_delay_ms=150, priority=6),
+    "nlp":     TritonModelConfig("nlp_model",     max_batch_size=8,  max_queue_delay_ms=200, priority=6),
 }
 
 
@@ -205,23 +206,23 @@ class TritonSchedulerSim:
             # Run inference
             self._dispatch(batch, engine, model_type)
 
-    def _dispatch(self, batch: List[WorkloadRequest], engine, model_type: str):
-        """Run inference for a batch, mark all requests complete."""
-        if model_type == "nlp":
-            inputs = [r.input_data for r in batch]
-        else:
-            inputs = [torch.tensor(r.input_data).unsqueeze(0) for r in batch]
-
-        t0    = time.perf_counter()
-        _, inf_ms = engine.infer(inputs)
-        result_at = time.perf_counter() * 1000.0
-
-        for req in batch:
-            req.result_at_ms = result_at
-            req.inference_ms = inf_ms
-            evt = self._result_events.get(req.request_id)
-            if evt:
-                evt.set()
+    def _dispatch(self, batch, engine, model_type):
+      if model_type == "nlp":
+          inputs = [r.input_data for r in batch]
+      else:
+          inputs = [torch.tensor(r.input_data).unsqueeze(0) for r in batch]
+  
+      with self._gpu_lock:   # ADD THIS — forces GPU serialization across model threads
+          t0 = time.perf_counter()
+          _, inf_ms = engine.infer(inputs)
+          result_at = time.perf_counter() * 1000.0
+  
+      for req in batch:
+          req.result_at_ms = result_at
+          req.inference_ms = inf_ms
+          evt = self._result_events.get(req.request_id)
+          if evt:
+              evt.set()
 
 
 # ---------------------------------------------------------------------------
