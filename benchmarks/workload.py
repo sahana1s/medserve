@@ -18,8 +18,15 @@ class LoadLevel(Enum):
     LOW    = "low"
     MEDIUM = "medium"
     HIGH   = "high"
+    STRESS = "stress"
 
-LOAD_RATES   = {LoadLevel.LOW: 5.0, LoadLevel.MEDIUM: 20.0, LoadLevel.HIGH: 50.0}
+# LOAD_RATES   = {LoadLevel.LOW: 5.0, LoadLevel.MEDIUM: 20.0, LoadLevel.HIGH: 50.0}
+LOAD_RATES = {
+    LoadLevel.LOW:    5.0,
+    LoadLevel.MEDIUM: 20.0,
+    LoadLevel.HIGH:   50.0,
+    LoadLevel.STRESS: 100.0,
+}
 DEFAULT_MIX  = {"icu": 0.20, "nlp": 0.30, "imaging": 0.50}
 ICU_HEAVY    = {"icu": 0.50, "nlp": 0.25, "imaging": 0.25}
 BALANCED_MIX = {"icu": 0.33, "nlp": 0.34, "imaging": 0.33}
