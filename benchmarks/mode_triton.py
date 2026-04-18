@@ -77,7 +77,6 @@ class TritonModelConfig:
         self.max_batch_size     = max_batch_size
         self.max_queue_delay_ms = max_queue_delay_ms
         self.priority           = priority
-        self._gpu_lock = threading.Lock()  # simulates single GPU serialization
 
 
 # Triton config for each workload — matches what a Triton admin would set
@@ -122,6 +121,7 @@ class TritonSchedulerSim:
         self._lock   = threading.Lock()
         self._stop   = threading.Event()
         self._result_events: Dict[str, threading.Event] = {}
+        self._gpu_lock = threading.Lock()  # simulates single GPU serialization
 
     def submit(self, req: WorkloadRequest) -> threading.Event:
         """Add request to its model-type queue. Returns completion event."""
