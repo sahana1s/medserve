@@ -18,23 +18,22 @@ class LoadLevel(Enum):
     LOW    = "low"
     MEDIUM = "medium"
     HIGH   = "high"
-    STRESS = "stress"
 
-# LOAD_RATES   = {LoadLevel.LOW: 5.0, LoadLevel.MEDIUM: 20.0, LoadLevel.HIGH: 50.0}
 LOAD_RATES = {
-    LoadLevel.LOW:    5.0,
-    LoadLevel.MEDIUM: 20.0,
-    LoadLevel.HIGH:   50.0,
-    LoadLevel.STRESS: 100.0,
+    LoadLevel.LOW:    10.0,     # Was 5 — too sparse
+    LoadLevel.MEDIUM: 30.0,     # Was 20 — peak hours need higher load
+    LoadLevel.HIGH:   60.0,     # Was 50 — stress test
 }
 DEFAULT_MIX  = {"icu": 0.20, "nlp": 0.30, "imaging": 0.50}
 ICU_HEAVY    = {"icu": 0.50, "nlp": 0.25, "imaging": 0.25}
 BALANCED_MIX = {"icu": 0.33, "nlp": 0.34, "imaging": 0.33}
 # SLA_MS       = {"icu": 100,  "nlp": 300,  "imaging": 500}
-SLA_MS = {"icu": 250, "nlp": 500, "imaging": 1000}
-# Rationale: 2.5–3× median GPU inference time, matching NVIDIA's 
-# recommended headroom for priority inference workloads
-
+# benchmarks/workload.py
+SLA_MS = {
+    "icu":     250,      # 80ms inference + 170ms headroom
+    "nlp":     500,      # 150ms inference + 350ms headroom  
+    "imaging": 1200,     # 400ms inference + 800ms headroom (batch-friendly)
+}
 
 @dataclass
 class WorkloadRequest:
@@ -107,15 +106,26 @@ class WorkloadGenerator:
 
     def _make_input(self, model_type: str):
         if model_type == "icu":
+            # Current: 48×34 = 1,632 floats, inference ~1ms
+            # Better: add variable-size time series to simulate real variance
+            seq_len = np.random.randint(40, 56)  # variable length
             return np.clip(
-                self.np_rng.normal(0.5, 0.15, (48, 34)), 0.0, 1.0
+                self.np_rng.normal(0.5, 0.15, (seq_len, 34)), 0.0, 1.0
             ).astype(np.float32)
         elif model_type == "imaging":
+            # Current: 3×224×224 = 150k floats
+            # Better: same size, but use realistic latency profiling
             return self.np_rng.normal(
                 loc=[[[0.485]], [[0.456]], [[0.406]]],
                 scale=[[[0.229]], [[0.224]], [[0.225]]],
                 size=(3, 224, 224)
             ).astype(np.float32)
         elif model_type == "nlp":
-            return self.rng.choice(self.CLINICAL_TEXTS)
+            # Current: fixed text
+            # Better: variable-length to create realistic variance
+            text = self.rng.choice(self.CLINICAL_TEXTS)
+            # Randomly extend to simulate batch composition effects
+            if self.rng.random() > 0.7:
+                text += " " + self.rng.choice(self.CLINICAL_TEXTS)
+            return text
         raise ValueError(f"Unknown model_type: {model_type}")
