@@ -92,11 +92,14 @@ class ICUInferenceEngine(BaseInferenceEngine):
     # -------------------------------------------------------------
     def preprocess(self, raw_input: Any) -> torch.Tensor:
         import numpy as np
-
+    
         if isinstance(raw_input, np.ndarray):
-            return torch.from_numpy(raw_input).float()
-
-        return torch.tensor(raw_input, dtype=torch.float32)
+            assert raw_input.shape == (48, 34), f"Bad ICU shape: {raw_input.shape}"
+            raw_input = torch.from_numpy(raw_input).float()
+        elif not isinstance(raw_input, torch.Tensor):
+            raw_input = torch.tensor(raw_input, dtype=torch.float32)
+    
+        return raw_input.unsqueeze(0) if raw_input.dim() == 2 else raw_input
 
     # -------------------------------------------------------------
     # CRITICAL FIX: VARIABLE-LENGTH BATCHING
