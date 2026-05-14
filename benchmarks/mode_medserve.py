@@ -206,87 +206,74 @@ class MedServeScheduler:
 
     #     if len(queue) >= batch_size or nearly_expired:
     #         self._dispatch(candidates)
+    # benchmarks/mode_medserve.py — replace _dispatch_one_cycle()
+
     def _dispatch_one_cycle(self):
         """
-        Fixed: deadline-aware dispatch that protects ICU without starving NLP/imaging.
-        
-        Key insight: dispatch the type whose head request has the LEAST remaining
-        time relative to its inference cost. This naturally prioritizes ICU when
-        it's urgent without monopolizing the GPU when it isn't.
+        Three-tier dispatch:
+        1. Emergency: any request with <1.5×avg_inference left
+        2. Proactive: if ICU queue exists, batch it (don't wait for other types)
+        3. Normal: batch by type, sorted by urgency
         """
-    
-        # --- STEP 1: Emergency dispatch — any type with imminent deadline ---
-        # Check all types, dispatch the most urgent one
-        most_urgent_qr  = None
-        most_urgent_type = None
-    
-        for mtype, queue in self.queues.items():
-            if not queue:
-                continue
-            avg_ms    = self._avg_inf_ms[mtype]
-            threshold = self.config.ALPHA * avg_ms + self.config.SAFETY_MARGIN_MS + self.config.TICK_MS
-            for qr in queue:
-                if qr.time_remaining_ms < threshold:
-                    if most_urgent_qr is None or qr.urgency > most_urgent_qr.urgency:
-                        most_urgent_qr   = qr
-                        most_urgent_type = mtype
-    
-        if most_urgent_qr is not None:
-            # Dispatch all critical requests of this type as a batch
-            avg_ms    = self._avg_inf_ms[most_urgent_type]
-            threshold = self.config.ALPHA * avg_ms + self.config.SAFETY_MARGIN_MS + self.config.TICK_MS
-            critical  = [qr for qr in self.queues[most_urgent_type]
-                         if qr.time_remaining_ms < threshold]
-            self._dispatch(critical)
-            return
-    
-        # --- STEP 2: Proactive dispatch based on deadline urgency ---
-        # Pick the type whose head request has consumed the most of its SLA budget.
-        # This is different from urgency score — it's about proportional time consumed.
-        # A NLP request that has used 280ms of its 300ms SLA is more urgent than
-        # an ICU request that has used 5ms of its 100ms SLA, even though ICU has
-        # higher tier weight.
+        from system.request import ModelType
         
-        best_type       = None
-        best_consumed   = -1.0   # fraction of SLA budget consumed
-    
-        for mtype, queue in self.queues.items():
+        current_time = time.perf_counter() * 1000.0
+        
+        # --- TIER 1: Emergency dispatch ---
+        for mtype_str in ["icu", "nlp", "imaging"]:
+            queue = self.queues[mtype_str]
             if not queue:
                 continue
-            # Look at the head request (oldest = most time consumed)
-            head_qr      = min(queue, key=lambda r: r.req.sent_at_ms)
-            sla          = head_qr.req.sla_ms
-            elapsed      = (time.perf_counter() * 1000.0) - head_qr.req.sent_at_ms
-            # Weight by tier so ICU still gets preference when budget consumption is similar
-            tier_weight  = self.config.TIER_WEIGHTS.get(mtype, 1.0)
-            weighted     = (elapsed / sla) * tier_weight
-    
-            if weighted > best_consumed:
-                best_consumed = weighted
-                best_type     = mtype
-    
-        if best_type is None:
+            avg_ms = self._avg_inf_ms[mtype_str]
+            threshold = self.config.ALPHA * avg_ms
+            
+            critical = [qr for qr in queue if qr.time_remaining_ms < threshold]
+            if critical:
+                self._dispatch_batch(critical, mtype_str)
+                return
+        
+        # --- TIER 2: Proactive ICU ---
+        # ICU should never sit queued; dispatch immediately if any exists
+        if self.queues["icu"]:
+            batch_size = self._compute_batch_size()
+            candidates = sorted(self.queues["icu"], key=lambda r: r.urgency, reverse=True)
+            self._dispatch_batch(candidates[:batch_size], "icu")
             return
+        
+        # --- TIER 3: Normal dispatch by urgency ---
+        # Find the model type with the highest-urgency request
+        best_type = None
+        best_urgency = -1.0
+        for mtype in ["nlp", "imaging"]:
+            if self.queues[mtype]:
+                head_urgency = max(qr.urgency for qr in self.queues[mtype])
+                if head_urgency > best_urgency:
+                    best_urgency = head_urgency
+                    best_type = mtype
+        
+        if best_type:
+            batch_size = self._compute_batch_size()
+            candidates = sorted(self.queues[best_type], key=lambda r: r.urgency, reverse=True)
+            self._dispatch_batch(candidates[:batch_size], best_type)
     
-        batch_size = self._compute_batch_size()
-        queue      = self.queues[best_type]
-        candidates = sorted(queue, key=lambda r: r.urgency, reverse=True)[:batch_size]
-    
-        # Dispatch if: batch is full, OR head request has used >50% of its SLA budget
-        head_qr  = min(queue, key=lambda r: r.req.sent_at_ms)
-        elapsed  = (time.perf_counter() * 1000.0) - head_qr.req.sent_at_ms
-        budget_half_consumed = elapsed > (head_qr.req.sla_ms * 0.3)
-    
-        if len(queue) >= batch_size or budget_half_consumed:
-            self._dispatch(candidates)
-
-    # def _compute_batch_size(self) -> int:
-    #     icu_pressure = len(self.queues["icu"])
-    #     if icu_pressure >= self.config.HIGH_PRESSURE_THR:
-    #         return max(1, self.config.MAX_BATCH // 2)
-    #     if icu_pressure > 0:
-    #         return max(2, self.config.MAX_BATCH // 4)
-    #     return self.config.MAX_BATCH
+    def _dispatch_batch(self, batch, mtype_str):
+        """Execute inference on a batch."""
+        from system.request import ModelType
+        
+        if mtype_str == "nlp":
+            inputs = [qr.req.input_data for qr in batch]
+        else:
+            inputs = [torch.tensor(qr.req.input_data).unsqueeze(0) for qr in batch]
+        
+        engine = self.registry._engines[ModelType(mtype_str)]
+        _, inf_ms = engine.infer(inputs)
+        result_at_ms = time.perf_counter() * 1000.0
+        
+        for qr in batch:
+            qr.req.result_at_ms = result_at_ms
+            qr.req.inference_ms = inf_ms
+            self._result_events[qr.req.request_id].set()
+            self.queues[mtype_str].remove(qr)
 
     def _compute_batch_size(self) -> int:
         icu_pressure = len(self.queues["icu"])
