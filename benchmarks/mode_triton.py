@@ -207,22 +207,20 @@ class TritonSchedulerSim:
             self._dispatch(batch, engine, model_type)
 
     def _dispatch(self, batch, engine, model_type):
-      if model_type == "nlp":
-          inputs = [r.input_data for r in batch]
-      else:
-          inputs = [torch.tensor(r.input_data).unsqueeze(0) for r in batch]
-  
-      with self._gpu_lock:   # ADD THIS — forces GPU serialization across model threads
-          t0 = time.perf_counter()
-          _, inf_ms = engine.infer(inputs)
-          result_at = time.perf_counter() * 1000.0
-  
-      for req in batch:
-          req.result_at_ms = result_at
-          req.inference_ms = inf_ms
-          evt = self._result_events.get(req.request_id)
-          if evt:
-              evt.set()
+        """Triton dispatches one model at a time (GPU serialized)."""
+        if model_type == "nlp":
+            inputs = [r.input_data for r in batch]
+        else:
+            inputs = [torch.tensor(r.input_data).unsqueeze(0) for r in batch]
+        
+        with self._gpu_lock:  # CRITICAL: this forces per-model serialization
+            _, inf_ms = engine.infer(inputs)
+            result_at_ms = time.perf_counter() * 1000.0
+        
+        for req in batch:
+            req.result_at_ms = result_at_ms
+            req.inference_ms = inf_ms
+            self._result_events[req.request_id].set()
 
 
 # ---------------------------------------------------------------------------
