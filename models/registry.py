@@ -92,15 +92,19 @@ class ModelRegistry:
     def warmup_all(self, n_runs=20):
         print("\n[Registry] Warming up and measuring actual latencies...")
         for mtype, engine in self._engines.items():
-            latencies = []
-            for _ in range(n_runs):
-                dummy = [torch.zeros(1, *engine.metadata.input_shape)] * 4
-                _, ms = engine.infer(dummy)
-                latencies.append(ms)
+            if not hasattr(engine, "warmup"):
+                continue
+            latencies = engine.warmup(n_runs=n_runs)
+            if not latencies:
+                continue
             latencies.sort()
             avg = sum(latencies) / len(latencies)
-            p99 = latencies[int(0.99 * len(latencies))]
-            print(f"  {mtype.value:8s}  avg={avg:.1f}ms  p99={p99:.1f}ms")
+            p99 = latencies[min(len(latencies)-1, int(0.99 * len(latencies)))]
+            print(
+                f"  {mtype.value:8s}  "
+                f"avg={avg:.1f}ms  p99={p99:.1f}ms"
+            )
+        print("[Registry] Ready.\n")
 
     # ---------------------------------------------------------
     # Inference
