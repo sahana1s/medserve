@@ -81,6 +81,7 @@ Workload (Poisson arrivals)
 All use pretrained weights (no training required for scheduler research).
 
 ### Scheduler Algorithm
+```bash
 Every TICK_MS (10ms):
 1. Compute urgency for all queued requests: `urgency = tier_weight / time_remaining_ms`
   - ICU: tier_weight=3.0, time_remaining=(arrival+100ms−now)
@@ -93,10 +94,11 @@ Every TICK_MS (10ms):
   - High pressure (ICU queue ≥3): batch_size=8 (free GPU cycles faster)
 4. Select top-k by urgency, dispatch when batch full or near-deadline
 5. Apply aging every 2 seconds: `urgency_multiplier ×= 1.2` (prevent starvation)
+```
 
 ### Configuration
 In `benchmarks/mode_medserve.py`:
-```bash
+```python
 config = SchedulerConfig(
     TICK_MS           = 10.0,    # scheduling loop interval
     ALPHA             = 1.5,     # dispatch threshold multiplier
